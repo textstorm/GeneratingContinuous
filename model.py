@@ -11,7 +11,6 @@ class BaseModel(object):
              reverse_vocab_table=None,
              scope=None,
              name=None):
-
     self.vocab_size = args.vocab_size
     self.embed_size = args.embed_size
     self.num_layers = args.num_layers
@@ -41,8 +40,11 @@ class BaseModel(object):
 
     self.batch_size = tf.size(self.iterator.source_sequence_length)
 
-    self.tvars = tf.trainable_variables()
-    self.saver = tf.train.Saver(tf.global_variables())
+    if self.mode != tf.contrib.learn.ModeKeys.INFER:
+      ## Count the number of predicted words for compute ppl.
+      self.predict_count = tf.reduce_sum(self.iterator.target_sequence_length)
+
+    self.global_step = tf.Variable(0, trainable=False)
 
   def build_graph(self):
     raise NotImplementedError("Implement how to build graph")
@@ -168,6 +170,27 @@ class RAE(BaseModel):
         scope=scope,
         name=name)
 
+    res = self.build_graph()
+    if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
+      self.train_loss = res[1]
+      self.train_ppl = res[2]
+    elif self.mode == tf.contrib.learn.ModeKeys.EVAL:
+      self.eval_loss = res[1]
+    elif self.mode == tf.contrib.learn.ModeKeys.INFER:
+      self.infer_logits, _, _, self.final_state, self.sample_id = res
+      self.sample_words = reverse_vocab_table.lookup(tf.to_int64(self.sample_id))
+
+    params = tf.trainable_variables()
+    if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
+      gradients = tf.gradients(
+          self.train_loss, params)
+      clipped_gradients, _ = tf.clip_by_global_norm(gradients, self.max_grad_norm)
+      self.update = self.optimizer.apply_gradients(
+          zip(clipped_gradients, params), global_step=self.global_step)
+
+    self.tvars = tf.trainable_variables()
+    self.saver = tf.train.Saver(tf.global_variables())
+
   def build_graph(self):
     """ model graph """
     with tf.variable_scope("seq2seq"):
@@ -270,18 +293,56 @@ class RAE(BaseModel):
     iterator = self.iterator
     max_len = self.get_max_time(iterator.target_input)
     weight = tf.sequence_mask(iterator.target_sequence_length, max_len, dtype=logits.dtype)
-    rec_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
+    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
         labels=iterator.target_output, logits=logits)
-    rec_loss = tf.reduce_sum(rec_loss * weight, 1)
-    avg_rec_loss = tf.reduce_mean(rec_loss)
-    rec_ppl = tf.exp(tf.reduce_sum(rec_loss) / tf.to_float(tf.reduce_sum(
+    loss = tf.reduce_sum(rec_loss * weight, 1)
+    avg_loss = tf.reduce_mean(rec_loss)
+    ppl = tf.exp(tf.reduce_sum(loss) / tf.to_float(tf.reduce_sum(
         iterator.target_sequence_length)))
-    kl_loss = -0.5 * tf.reduce_sum(1. + logvar - mu ** 2 - tf.exp(logvar), 1)
-    avg_kl_loss = tf.reduce_mean(kl_loss)
-    avg_loss = tf.reduce_mean(rec_loss + kl_loss)
-    return avg_rec_loss, rec_ppl, avg_kl_loss, avg_loss
+    return avg_loss, ppl
 
-class VRAE(object):
+  def train(self, sess):
+    assert self.mode == tf.contrib.learn.ModeKeys.TRAIN
+    return sess.run([self.update, 
+                     self.train_loss,
+                     self.train_ppl,
+                     self.global_step,
+                     self.predict_count,
+                     self.batch_size])
+
+  def eval(self, sess):
+    assert self.mode == tf.contrib.learn.ModeKeys.EVAL
+    return sess.run([self.eval_loss,
+                     self.predict_count,
+                     self.batch_size])
+
+  def infer(self, sess):
+    assert self.mode == tf.contrib.learn.ModeKeys.INFER
+    _, sample_id, sample_words = sess.run(
+        [self.infer_logits, self.sample_id, self.sample_words])
+    return sample_id[0], sample_words[0]
+
+  def _build_decoder_cell(self, num_units, forget_bias, num_layers,
+                          encoder_output, encoder_state, mode,
+                          initializer, dropout=0.0):
+
+    cell_list = []
+    for i in range(num_layers):
+      cell = self._single_cell(num_units, forget_bias, mode, initializer, dropout)
+      cell_list.append(cell)
+
+    if num_layers == 1:
+      cell = cell_list[0]
+    else:
+      cell = tf.contrib.rnn.MultiRNNCell(cell_list)
+
+    if mode == tf.contrib.learn.ModeKeys.INFER and self.beam_width > 0:
+      decoder_initial_state = tf.contrib.seq2seq.tile_batch(decoder_initial_state, self.beam_width)
+    else:
+      decoder_initial_state = decoder_initial_state
+    return cell, decoder_initial_state
+
+class VRAE(BaseModel):
   def __init__(self, 
                args, 
                mode,
@@ -290,7 +351,7 @@ class VRAE(object):
                reverse_vocab_table=None,
                scope=None,
                name=None):
-    super(RAE, self).__init__(
+    super(VRAE, self).__init__(
         args=args,
         mode=mode,
         iterator=iterator,
@@ -313,11 +374,6 @@ class VRAE(object):
       self.infer_logits, _, _, _, _, self.final_state, self.sample_id = res
       self.sample_words = reverse_vocab_table.lookup(tf.to_int64(self.sample_id))
 
-    if self.mode != tf.contrib.learn.ModeKeys.INFER:
-      ## Count the number of predicted words for compute ppl.
-      self.predict_count = tf.reduce_sum(self.iterator.target_sequence_length)
-
-    self.global_step = tf.Variable(0, trainable=False)
     params = tf.trainable_variables()
     if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
       gradients = tf.gradients(
@@ -326,6 +382,9 @@ class VRAE(object):
       self.update = self.optimizer.apply_gradients(
           zip(clipped_gradients, params), global_step=self.global_step)
 
+    self.tvars = tf.trainable_variables()
+    self.saver = tf.train.Saver(tf.global_variables())
+    
   def build_graph(self):
     """ model graph """
     with tf.variable_scope("seq2seq"):
