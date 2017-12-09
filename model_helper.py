@@ -68,7 +68,7 @@ def build_eval_model(args, name="eval_model", use_attention=False, scope=None):
 
 class InferModel(
     collections.namedtuple("InferModel",
-                           ("graph", "model", "file_placeholder",
+                           ("graph", "model", "data_placeholder",
                             "batch_size_placeholder", "iterator"))):
   pass
 
@@ -77,18 +77,30 @@ def build_infer_model(args, name="infer_model", use_attention=False, scope=None)
   vocab_dir = args.vocab_dir
 
   with graph.as_default(), tf.container(scope or 'infer'):
-    vocab_table = src_vocab_table = lookup_ops.index_table_from_file(
-        vocab_dir, default_value=0)
+    vocab_table = lookup_ops.index_table_from_file(vocab_dir, default_value=0)
     reverse_vocab_table = lookup_ops.index_to_string_table_from_file(
         vocab_dir, default_value="<unk>")
+
+    data_placeholder = tf.placeholder(shape=(None), dtype=tf.string)
+    batch_size_placeholder = tf.placeholder(shape=[], dtype=tf.int64)
+    dataset = tf.data.Dataset.from_tensor_slices(data_placeholder)
+    iterator = utils.get_infer_iterator(
+        dataset=dataset,
+        vocab_table=vocab_table,
+        batch_size=batch_size_placeholder,
+        source_reverse=False)
 
     if use_attention:
       pass
     else:
-      model = VRAE(args, tf.contrib.learn.ModeKeys.INFER, 
+      model = VRAE(args, tf.contrib.learn.ModeKeys.INFER, iterator,
           vocab_table, reverse_vocab_table, name=name)
 
-    return InferModel(graph=graph, model=model)
+    return InferModel(graph=graph, 
+                      model=model,
+                      data_placeholder=data_placeholder,
+                      batch_size_placeholder=batch_size_placeholder,
+                      iterator=iterator)
 
 def load_model(model, ckpt, session, name):
   start_time = time.time()
