@@ -6,7 +6,6 @@ import sys
 import time
 
 def load_data(file_dir):
-  print_out("loading data files...")
   start_time = time.time()
   f = open(file_dir, 'r')
   sentences = []
@@ -192,20 +191,18 @@ def get_iterator(dataset,
     source_sequence_length=src_seq_len,
     target_sequence_length=tgt_seq_len)
 
-def get_infer_iterator(src_dataset,
-                       src_vocab_table,
+def get_infer_iterator(dataset,
+                       vocab_table,
                        batch_size,
                        source_reverse=False):
-  unk_id = tf.cast(src_vocab_table.lookup(tf.constant("<unk>")), tf.int32)
-  src_eos_id = tf.cast(src_vocab_table.lookup(tf.constant("/s")), tf.int32)
+  unk_id = tf.cast(vocab_table.lookup(tf.constant("<unk>")), tf.int32)
 
-  src_dataset = src_dataset.map(lambda src: tf.string_split([src]).values)
-  src_dataset = src_dataset.map(
-    lambda src: tf.cast(src_vocab_table.lookup(src), tf.int32))
+  dataset = dataset.map(lambda src: tf.string_split([src]).values)
+  dataset = dataset.map(lambda src: tf.cast(vocab_table.lookup(src), tf.int32))
 
   if source_reverse:
-    src_dataset = src_dataset.map(lambda src: tf.reverse(src, axis=[0]))
-  src_dataset = src_dataset.map(lambda src: (src, tf.size(src)))
+    dataset = dataset.map(lambda src: tf.reverse(src, axis=[0]))
+  dataset = dataset.map(lambda src: (src, tf.size(src)))
 
   def batching_func(x):
     return x.padded_batch(
@@ -217,7 +214,7 @@ def get_infer_iterator(src_dataset,
           unk_id,
           0))
 
-  batch_dataset = batching_func(src_dataset)
+  batch_dataset = batching_func(dataset)
   batch_iterator = batch_dataset.make_initializable_iterator()
   (source, src_seq_len) = batch_iterator.get_next()
   return BatchedInput(
